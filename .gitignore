@@ -1,2 +1,10 @@
 vmoe-venv/*
 ./vmoe/data_downloads/*
+data/*
+*tensorflow_datasets/
+**/saved_checkpoints/
+**/testing_saved_checkpoints/
+**/saved_checkpoints_2/
+vmoe/vmoe/manual_dir/ILSVRC2012_img_val.tar
+**/__pycache__*
+*.tar

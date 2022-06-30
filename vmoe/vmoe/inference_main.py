@@ -59,8 +59,9 @@ def main(argv: Sequence[str]) -> None:
   logging.info('Using JAX XLA backend %s', jax_xla_backend)
   # Log the configuration passed to the main script.
   FLAGS.config.num_expert_partitions = 1
-  FLAGS.config.dataset.test.data_dir="./data_downloads/data_dir"
-  FLAGS.config.dataset.test.manual_dir="./data_downloads/manual_dir"
+  FLAGS.config.dataset.test.data_dir = "./data_dir"
+  FLAGS.config.dataset.test.manual_dir = "./manual_dir"
+  FLAGS.config.initialization.prefix = "./vmoe/saved_checkpoints/ckpt_1" 
   tmp_dict = FLAGS.config.to_dict() #dataset.train
   del tmp_dict['dataset']['train']
   del tmp_dict['dataset']['test_real']

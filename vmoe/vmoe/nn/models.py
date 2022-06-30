@@ -17,4 +17,5 @@
 from vmoe.nn.external import MlpMixer
 from vmoe.nn.external import VisionTransformer
 from vmoe.nn.vit_moe import VisionTransformerMoe
+from vmoe.nn.vit_moe import VisionTransformerMoe_AdversarialAttack
 from vmoe.nn.vit_moe_ensemble import VisionTransformerMoeEnsemble

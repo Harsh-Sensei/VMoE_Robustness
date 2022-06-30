@@ -14,6 +14,9 @@
 
 """Main script."""
 from typing import Sequence
+import sys
+sys.path.append("./")
+sys.path.append("../vision_transformer")
 
 from absl import app
 from absl import flags
@@ -23,6 +26,8 @@ import jax
 from ml_collections import config_flags
 import tensorflow as tf
 from vmoe.train import trainer
+
+
 
 flags.DEFINE_string('workdir', None, 'Directory to store logs and model data.')
 config_flags.DEFINE_config_file(
@@ -58,6 +63,8 @@ def main(argv: Sequence[str]) -> None:
                                        f'process_count: {jax.process_count()}')
   platform.work_unit().create_artifact(platform.ArtifactType.DIRECTORY,
                                        FLAGS.workdir, 'workdir')
+  FLAGS.config.num_expert_partitions = 1 # htg added
+  FLAGS.config.initialization.prefix = "./vmoe/saved_checkpoints_2/ckpt_1" 
   # Select which mode to run.
   mode = FLAGS.config.get('mode', 'train')
   if mode == 'train':

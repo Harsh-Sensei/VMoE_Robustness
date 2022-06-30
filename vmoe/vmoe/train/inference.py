@@ -26,6 +26,7 @@ import flax
 import flax.linen as nn
 import flax.serialization
 import flax.training.train_state
+from flax.training import checkpoints
 import flax.traverse_util
 import jax
 from jax.experimental import maps
@@ -41,6 +42,7 @@ from vmoe.checkpoints import partitioned as checkpoints_partitioned
 from vmoe.checkpoints import periodic_actions as checkpoints_periodic_actions
 from vmoe.data import input_pipeline
 from vmoe.data import pjit_utils
+from vmoe.data.custom_imagenet_tfds import Custom_Imagenet2012_val_tfds
 from vmoe.evaluate import ensemble
 from vmoe.evaluate import evaluator
 from vmoe.evaluate import fewshot
@@ -49,7 +51,7 @@ from vmoe.train import initialization
 from vmoe.train import optimizer
 from vmoe.train import periodic_actions as train_periodic_actions
 from vmoe.train import train_state as train_state_module
-
+import matplotlib.pyplot as plt
 
 Array = jax.numpy.ndarray
 AsyncResult = multiprocessing.pool.AsyncResult
@@ -246,13 +248,12 @@ def create_train_state_initialize_from_scratch_fn(
     variables = model.init(rngs, inputs)
     rngs = dict(**rngs)
     rngs.pop('params')  # This PRNGKey is not used anymore.
-    return TrainState.create(
-        apply_fn=model.apply, tx=tx, rngs=rngs, **variables)
 
+    return TrainState.create(
+        apply_fn=model.apply, tx=tx, rngs=rngs, **variables) 
   return initialize
 
-
-def restore_or_create_train_state(
+def directly_create_train_state(
     *,
     prefix: str,
     initialize_fn: TrainStateInitFromScratchFn,
@@ -279,24 +280,123 @@ def restore_or_create_train_state(
     A TrainState.
   """
   mesh = mesh or maps.thread_resources.env.physical_mesh
-  prefix = checkpoints_base.find_latest_complete_checkpoint_for_prefix(
-      prefix=prefix, suffixes=('.index', '.data'))
-  if prefix:
-    # Restore train_state from checkpoints to CPU memory.
-    train_state = checkpoints_partitioned.restore_checkpoint(
-        prefix=prefix,
-        tree=jax.eval_shape(initialize_fn, rngs),
-        axis_resources=axis_resources,
-        mesh=mesh,
-        thread_pool=thread_pool)
-    # Copy TrainState to device memory, and return.
-    with maps.Mesh(mesh.devices, mesh.axis_names):
-      return pjit.pjit(
-          fun=lambda x: x,
-          in_axis_resources=(axis_resources,),
-          out_axis_resources=axis_resources)(train_state)
+
   # If no complete checkpoints exist with the given prefix, create a train
   # state from scratch on device.
+  return create_train_state(
+      initialize_fn=initialize_fn, axis_resources=axis_resources, rngs=rngs,
+      mesh=mesh)
+def create_or_reuse_train_state(
+    *,
+    initialize_fn: TrainStateInitFromScratchFn,
+    axis_resources: TrainStateAxisResources,
+    rngs: Mapping[str, PRNGKey],
+    reuse_train_state: TrainState,
+    mesh: Optional[Mesh] = None,
+) -> TrainState:
+  """Creates a TrainState object initialized from scratch, re-using some parts.
+  Args:
+    initialize_fn: Function used to create and initialize a train state from
+      scratch.
+    axis_resources: A PyTree with the same structure as a TrainState, but with
+      PartitionSpec leaves, indicating how the output TrainState is partitioned.
+    rngs: Dictionary of PRNGs to use during model initialization.
+    reuse_train_state: TrainState containing the arrays to re-use. All arrays
+      with a size other than 0 are re-used.
+    mesh: Logical mesh used by pjit. If None, uses the currently active mesh.
+  Returns:
+    A TrainState.
+  """
+  mesh = mesh or maps.thread_resources.env.physical_mesh
+  out_axis_resources = axis_resources
+  # Replace ShapeDtypeStruct objects with Numpy arrays of size 0.
+  # pylint: disable=g-long-lambda
+  reuse_train_state = jax.tree_map(
+      lambda x: np.array([], dtype=x.dtype)
+      if isinstance(x, jax.ShapeDtypeStruct) else np.asarray(x),
+      reuse_train_state)
+  # pylint: enable=g-long-lambda
+  # Replace PartitionSpec of arrays with size = 0. These are not partitioned.
+  in_axis_resources = jax.tree_map(
+      lambda x, r: pjit.PartitionSpec() if x.size == 0 else r,
+      reuse_train_state, axis_resources)
+  # Wrap the given initialize_fn with a new one that selects the arrays in the
+  # reuse_train_state or newly created arrays based on the size of the first.
+  # We leverage the fact that XLA will remove unused variables/ops when this
+  # new initialize function is compiled.
+  def initialize(reuse_train_state: TrainState, rngs: Mapping[str, PRNGKey]):
+    train_state = initialize_fn(rngs)
+    return jax.tree_map(
+        lambda a, b: b if a.size == 0 else a, reuse_train_state, train_state)
+
+  with maps.Mesh(mesh.devices, mesh.axis_names):
+    return pjit.pjit(
+        initialize,
+        in_axis_resources=(in_axis_resources, None),
+        out_axis_resources=out_axis_resources,
+        donate_argnums=(0,))(reuse_train_state, rngs)
+
+
+
+def restore_or_create_train_state(
+    *,
+    prefix: str,
+    initialize_fn: TrainStateInitFromScratchFn,
+    axis_resources: TrainState,
+    rngs: Mapping[str, PRNGKey],
+    mesh: Optional[Mesh] = None,
+    thread_pool: Optional[ThreadPool] = None,
+    initialization_kwargs: Optional[Mapping[str, Any]] = None,
+) -> TrainState:
+  """Restores a TrainState from the latest complete checkpoint or creates one.
+  Args:
+    prefix: Prefix used to find the checkpoint (e.g. '/tmp/ckpt'). This assumes
+      that checkpoints are partitioned. Thus, a complete checkpoint has files
+      such as '/tmp/ckpt_1.index' and '/tmp/ckpt_1.data-?????-of-?????'.
+    initialize_fn: Function used to create and initialize a train state from
+      scratch.
+    axis_resources: A PyTree with the same structure as a TrainState, but with
+      PartitionSpec leaves.
+    rngs: Dictionary of PRNGs to use during model initialization.
+    mesh: Logical mesh used by pjit. If None, uses the currently active mesh.
+    thread_pool: Thread pool used to restore checkpoints.
+    initialization_kwargs: Optional dictionary containing the kwargs used to
+      initialize the TrainState from an existing checkpoint.
+  Returns:
+    A TrainState.
+  """
+  mesh = mesh or maps.thread_resources.env.physical_mesh
+  # prefix = checkpoints_base.find_latest_complete_checkpoint_for_prefix(
+  #     prefix=prefix, suffixes=('.index', '.data'))
+  # if prefix:
+  #   # Restore train_state from checkpoints to CPU memory.
+  #   train_state = checkpoints_partitioned.restore_checkpoint(
+  #       prefix=prefix,
+  #       tree=jax.eval_shape(initialize_fn, rngs),
+  #       axis_resources=axis_resources,
+  #       mesh=mesh,
+  #       thread_pool=thread_pool)
+  #   # Copy TrainState to device memory, and return.
+  #   with maps.Mesh(mesh.devices, mesh.axis_names):
+  #     return pjit.pjit(
+  #         fun=lambda x: x,
+  #         in_axis_resources=(axis_resources,),
+  #         out_axis_resources=axis_resources,
+  #         donate_argnums=(0,))(train_state)
+  if initialization_kwargs:
+    # Compute global shapes of the TrainState and convert them to local shapes.
+    train_state = jax.eval_shape(initialize_fn, rngs)
+    # train_state = tree_global_to_local_shape(train_state, axis_resources, mesh)
+    # Initialize TrainState from checkpoint. Arrays that are not initialized,
+    # are ShapeDtypeStruct objects.
+    train_state = initialize_train_state_from_checkpoint(
+        train_state=train_state,
+        axis_resources=axis_resources,
+        **initialization_kwargs)
+    return create_or_reuse_train_state(
+        initialize_fn=initialize_fn, axis_resources=axis_resources, rngs=rngs,
+        mesh=mesh, reuse_train_state=train_state)
+  # Otherwise, create a new train state from scratch on device.
   return create_train_state(
       initialize_fn=initialize_fn, axis_resources=axis_resources, rngs=rngs,
       mesh=mesh)
@@ -527,29 +627,30 @@ def evaluate(config: ml_collections.ConfigDict, workdir: str):
     return _evaluate(config, workdir, mesh)
 
 
+
 def _evaluate(config: ml_collections.ConfigDict, workdir: str,
                         mesh: Mesh):
   """Trains a model and evaluates it periodically."""
-  #datasets = input_pipeline.get_datasets(config.dataset)
-  #if 'test' not in datasets:
-  #  raise KeyError(f'You must have a "test" variant of the dataset. '
-  #                 f'Available variants are {sorted(datasets.keys())!r}')
-  #test_examples = input_pipeline.get_data_num_examples(config.dataset.test)
-  #test_batch_size = config.dataset.test.batch_size
+  datasets = input_pipeline.get_eval_dataset(config.dataset)
+  if 'test' not in datasets:
+   raise KeyError(f'You must have a "test" variant of the dataset. '
+                  f'Available variants are {sorted(datasets.keys())!r}')
+  test_examples = 50000 #input_pipeline.get_custom_data_num_examples(config.dataset.test, )
+  test_batch_size = config.dataset.test.batch_size
   train_steps, train_epochs = get_train_steps_and_epochs(
-      train_steps=10000, #config.get('train_steps'),
-      train_epochs=None, #config.get('train_epochs'),
-      train_batch_size=1024,
-      train_examples=10)
-  # logging.info(
-  #     'Training for %d steps (%g epochs) over %d examples, with a '
-  #     'batch size of %d', train_steps, train_epochs, test_examples,
-  #     test_batch_size)
+      train_steps=config.get('train_steps'),
+      train_epochs=config.get('train_epochs'),
+      train_batch_size=test_batch_size,
+      train_examples=test_examples)
+  logging.info(
+      'Training for %d steps (%g epochs) over %d examples, with a '
+      'batch size of %d', train_steps, train_epochs, test_examples,
+      test_batch_size)
 
-  # # Get the global shape of the image array.
-  # test_image_shape = datasets['test'].element_spec['image'].shape
-  # test_image_shape = (test_batch_size,) + test_image_shape[1:]
-  test_image_shape = (1024, 384, 384, 3)
+  # Get the global shape of the image array.
+  test_image_shape = datasets['test'].element_spec['image'].shape
+  test_image_shape = (test_batch_size,) + test_image_shape[1:]
+  print("The input image shape is: ", test_image_shape)
   # # Get the PartitionSpec for the inputs. By default, the first axis (batch)
   # # is split among all axes of the logical device mesh, meaning that data is
   # # fully partitioned, as usual.
@@ -573,14 +674,14 @@ def _evaluate(config: ml_collections.ConfigDict, workdir: str,
       initialize_fn=train_state_initialize_fn,
       axis_resources=train_state_axis_resources,
       rngs=train_state_rngs,
-      thread_pool=ThreadPool())
+      thread_pool=ThreadPool(),
+      initialization_kwargs=config.get('initialization'))
   init_step = int(train_state.step)
-  if init_step == 0 and config.get('initialization'):
-    train_state = initialize_train_state_from_checkpoint(
-        train_state=train_state,
-        axis_resources=train_state_axis_resources,
-        **config.initialization)
-  print(train_state)
+  # if init_step == 0 and config.get('initialization'):
+  #   train_state = initialize_train_state_from_checkpoint(
+  #       train_state=train_state,
+  #       axis_resources=train_state_axis_resources,
+  #       **config.initialization) 
 
   train_loss_fn, eval_loss_fn, label_pred_fn = get_loss_fn(**config.loss)
   train_step_fn = functools.partial(train_step, loss_fn=train_loss_fn)
@@ -603,66 +704,68 @@ def _evaluate(config: ml_collections.ConfigDict, workdir: str,
       ),
       donate_argnums=(0, 1, 2))
 
-  # # Setup metric writer & hooks.
-  # writer = metric_writers.create_default_writer(
-  #     logdir=workdir, just_logging=jax.process_index() > 0)
-  # profile_hook = create_profile_hook(
-  #     workdir=workdir, **config.get('profile', {}))
-  # progress_hook = create_progress_hook(
-  #     writer=writer, first_step=init_step + 1, train_steps=train_steps,
-  #     **config.get('report_progress', {}))
-  # checkpoint_hook = create_checkpoint_hook(
-  #     workdir=workdir, progress_hook=progress_hook,
-  #     train_state_axis_resources=train_state_axis_resources,
-  #     train_steps=train_steps, **config.get('save_checkpoint', {}))
-  # evaluation_hook, config_model_eval = create_evaluation_hook(
-  #     base_model_config=config.model.copy_and_resolve_references(),
-  #     writer=writer,
-  #     progress_hook=progress_hook,
-  #     datasets={name: ds for name, ds in datasets.items() if name != 'train'},
-  #     loss_fn=eval_loss_fn,
-  #     label_pred_fn=label_pred_fn,
-  #     params_axis_resources=train_state_axis_resources.params,
-  #     input_axis_resources=input_axis_resources,
-  #     first_step=init_step + 1,
-  #     train_steps=train_steps,
-  #     extra_rng_keys=config.get('extra_rng_keys', []),
-  #     **config.get('evaluate', {}))
-  # fewshot_hook, _ = create_fewshot_hook(
-  #     base_model_config=config_model_eval,
-  #     writer=writer,
-  #     progress_hook=progress_hook,
-  #     variables_axis_resources={'params': train_state_axis_resources.params},
-  #     input_axis_resources=input_axis_resources,
-  #     first_step=init_step + 1,
-  #     train_steps=train_steps,
-  #     extra_rng_keys=config.get('extra_rng_keys', []),
-  #     **config.get('fewshot', {}))
-  # with metric_writers.ensure_flushes(writer):
+  # Setup metric writer & hooks.
+  writer = metric_writers.create_default_writer(
+      logdir=workdir, just_logging=jax.process_index() > 0)
+  profile_hook = create_profile_hook(
+      workdir=workdir, **config.get('profile', {}))
+  progress_hook = create_progress_hook(
+      writer=writer, first_step=init_step + 1, train_steps=train_steps,
+      **config.get('report_progress', {}))
+  checkpoint_hook = create_checkpoint_hook(
+      workdir=workdir, progress_hook=progress_hook,
+      train_state_axis_resources=train_state_axis_resources,
+      train_steps=train_steps, **config.get('save_checkpoint', {}))
+  evaluation_hook, config_model_eval = create_evaluation_hook(
+      base_model_config=config.model.copy_and_resolve_references(),
+      writer=writer,
+      progress_hook=progress_hook,
+      datasets={name: ds for name, ds in datasets.items() if name != 'train'},
+      loss_fn=eval_loss_fn,
+      label_pred_fn=label_pred_fn,
+      params_axis_resources=train_state_axis_resources.params,
+      input_axis_resources=input_axis_resources,
+      first_step=init_step + 1,
+      train_steps=train_steps,
+      extra_rng_keys=config.get('extra_rng_keys', []),
+      **config.get('evaluate', {}))
+  fewshot_hook, _ = create_fewshot_hook(
+      base_model_config=config_model_eval,
+      writer=writer,
+      progress_hook=progress_hook,
+      variables_axis_resources={'params': train_state_axis_resources.params},
+      input_axis_resources=input_axis_resources,
+      first_step=init_step + 1,
+      train_steps=train_steps,
+      extra_rng_keys=config.get('extra_rng_keys', []),
+      **config.get('fewshot', {}))
+  with metric_writers.ensure_flushes(writer):
   #   # Explicitly compile train_step here and report the compilation time.
   #   t0 = time.time()
   #   train_step_pjit = train_step_pjit.lower(*utils.tree_shape_dtype_struct((
   #       train_state,
-  #       datasets['train'].element_spec['image'],
-  #       datasets['train'].element_spec['labels']))).compile()
+  #       datasets['test'].element_spec['image'],
+  #       datasets['test'].element_spec['labels']))).compile()
   #   t1 = time.time()
   #   writer.write_scalars(init_step + 1, {'train/compile_secs': t1 - t0})
-    # Create iterator over the train dataset.
-    # tr_iter = pjit_utils.prefetch_to_device(
-    #     iterator=input_pipeline.make_dataset_iterator(datasets['train']),
-    #     axis_resources={'image': input_axis_resources,
-    #                     'labels': input_axis_resources},
-    #     size=config.dataset.train.get('prefetch_device'))
-    #for step, batch in zip(range(init_step + 1, train_steps + 1), tr_iter):
-      #profile_hook(step)
-      #with jax.profiler.StepTraceAnnotation('train', step_num=step):
-      # train_state, metrics = train_step_pjit(train_state, batch['image'],
-      #                                       batch['labels'])
-      #progress_hook(
+  #   # Create iterator over the train dataset.
+  #   tr_iter = pjit_utils.prefetch_to_device(
+  #       iterator=input_pipeline.make_dataset_iterator(datasets['test']),
+  #       axis_resources={'image': input_axis_resources,
+  #                       'labels': input_axis_resources},
+  #       size=config.dataset.test.get('prefetch_device'))
+    # print("htg_sensei")
+    for step in range(init_step + 1, train_steps + 1):
+      profile_hook(step)
+      # print(step)
+      # with jax.profiler.StepTraceAnnotation('train', step_num=step):
+      #   train_state, metrics = train_step_pjit(train_state, batch['image'],
+      #                                         batch['labels'])
+      # progress_hook(
       #    step, scalar_metrics={f'train/{k}': v for k, v in metrics.items()})
-      #checkpoint_hook(step, state=train_state)
-      #evaluation_hook(step, params=train_state.params)
-      #fewshot_hook(step, variables={'params': train_state.params})
+      # checkpoint_hook(step, state=train_state)
+      evaluation_hook(step, params=train_state.params)
+      # fewshot_hook(step, variables={'params': train_state.params})
   # Write a checkpoint containing only the params, with no TrainState, to use
   # for fine-tuning or releasing it.
   # logging.info('Saving checkpoint ready for releasing and fine-tuning.')

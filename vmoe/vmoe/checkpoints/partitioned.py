@@ -14,16 +14,18 @@
 
 """Functions for checkpointing partitioned models."""
 import collections
+import enum
 import functools
 import itertools
 import os
 from typing import Any, Iterator, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import jax
-import jax.experimental.maps as maps
-import jax.experimental.pjit as pjit
+from jax.experimental import maps
+from jax.experimental import pjit
 import numpy as np
 import vmoe.checkpoints.base
+import vmoe.checkpoints.serialization
 import vmoe.checkpoints.types
 import vmoe.multihost_utils
 import vmoe.utils
@@ -45,8 +47,15 @@ SliceNd = vmoe.checkpoints.types.SliceNd
 SliceNdArray = vmoe.checkpoints.types.SliceNdArray
 ThreadPool = vmoe.checkpoints.base.ThreadPool
 
+from_state_dict = vmoe.checkpoints.serialization.from_state_dict
+to_state_dict = vmoe.checkpoints.serialization.to_state_dict
 safe_map = vmoe.utils.safe_map
 safe_zip = vmoe.utils.safe_zip
+
+
+class Version(enum.Enum):
+  UNKNOWN = None
+  V1 = '20220622'
 
 
 def restore_checkpoint(*,
@@ -56,7 +65,6 @@ def restore_checkpoint(*,
                        mesh: Optional[Mesh] = None,
                        thread_pool: Optional[ThreadPool] = None) -> PyTree:
   """Restores a PyTree of partitioned arrays from sharded checkpoint.
-
   Args:
     prefix: Prefix of the checkpoint file (e.g. "/tmp/checkpoint_step_2").
     tree: Optional PyTree with the expected structure to restore. If given,
@@ -67,7 +75,6 @@ def restore_checkpoint(*,
     mesh: Logical mesh, indicating which device holds each element of the mesh.
     thread_pool: ThreadPool used to read the checkpoint files asynchronously.
       If None, a new pool will be created.
-
   Returns:
     The restored PyTree.
   """
@@ -77,12 +84,61 @@ def restore_checkpoint(*,
     raise ValueError("You must pass a non-empty mesh. If you didn't pass any, "
                      "check that you called restore_checkpoint from a "
                      "maps.mesh context.")
-  index = vmoe.checkpoints.base.restore_checkpoint(prefix + '.index', {
-      'shard_count': 0,
-      'index': tree if tree is not None else axis_resources,
-  })
+  # Restore index as a state dict.
+  index = vmoe.checkpoints.base.restore_checkpoint(prefix + '.index')
+  version = Version(index.get('version', Version.UNKNOWN))
   shard_count = index['shard_count']
   index = index['index']
+
+  print("The index is")
+  print(index)
+
+  if version == Version.UNKNOWN:
+    if tree is None and axis_resources is None:
+      raise ValueError(
+          'You must specify the tree and/or axis_resources arguments when '
+          f'restoring checkpoints from {Version.UNKNOWN}.')
+
+    # The index has the same structure as the input tree and the axis_resources.
+    # Obtain such structure before calling _restore_checkpoint.
+    index = from_state_dict(target=tree or axis_resources, state=index)
+    return _restore_checkpoint_from_index(
+          prefix=prefix,
+          shard_count=shard_count,
+          index=index,
+          axis_resources=axis_resources,
+          mesh=mesh,
+          thread_pool=thread_pool)
+  if version == Version.V1:
+    if axis_resources is None:
+      axis_resources_state_dict = None
+    else:
+      axis_resources_state_dict = to_state_dict(axis_resources)
+    state_dict = _restore_checkpoint_from_index(
+        prefix=prefix,
+        shard_count=shard_count,
+        index=index,
+        axis_resources=axis_resources_state_dict,
+        mesh=mesh,
+        thread_pool=thread_pool)
+    print("The keys of state_dict are ")
+    print(state_dict.keys())
+    if (tree or axis_resources) is not None:
+      return from_state_dict(target=tree or axis_resources, state=state_dict)
+    else:
+      return state_dict
+  raise ValueError(f'Unsupported checkpoint version: {version!r}')
+
+
+def _restore_checkpoint_from_index(
+    *,
+    prefix: str,
+    shard_count: int,
+    index: PyTree,
+    axis_resources: Optional[PyTree],
+    mesh: Mesh,
+    thread_pool: Optional[ThreadPool] = None) -> PyTree:
+  """Restores a PyTree of partitioned arrays from an index."""
   # axis_resources indicates how the data to be loaded will be partitioned.
   # If no axis_resources is given, assume that we don't want any partitioning.
   # This implies that all devices will store a copy of all the parameters, thus
@@ -158,9 +214,9 @@ def save_checkpoint(*,
                     num_shards: int = 0,
                     overwrite: bool = True,
                     makedirs: bool = True,
-                    thread_pool: Optional[ThreadPool] = None) -> AsyncResult:
+                    thread_pool: Optional[ThreadPool] = None,
+                    version: Version = Version.V1) -> AsyncResult:
   """Saves a PyTree of partitioned arrays into a sharded checkpoint.
-
   Args:
     prefix: Prefix of the checkpoint file (e.g. "/tmp/checkpoint_step_2").
     tree: PyTree with ndarray leaves to checkpoint.
@@ -177,19 +233,31 @@ def save_checkpoint(*,
       If False, the existence of the base dir is assumed.
     thread_pool: ThreadPool used to write the checkpoint files asynchronously.
       If None, a new pool will be created.
-
+    version: Write checkpoints using this version. DO NOT CHANGE UNLESS YOU KNOW
+      WHAT YOU ARE DOING.
   Returns:
     An AsyncResult object.
   """
+  # We convert the tree (and axis_resource) to a pure nested dictionary here.
+  # Before Version.V1, this was done implicitly in the subsequent calls to the
+  # function base.save_checkpoint(). However, the leaves of the PyTree were
+  # given by jax.tree_leaves(tree), which may give a different order than
+  # jax.tree_leaves(to_state_dict(tree)). When this happened, this prevented us
+  # to restore the checkpoint without passing any tree/axis_resources. Yet, this
+  # is a useful feature if we want to restore the checkpoint as a pure Python
+  # dictionary (i.e. a Flax state dict), when we don't know the original
+  # structure of the PyTree in the checkpoint.
+  if version is not Version.UNKNOWN:
+    tree = to_state_dict(tree)
+    axis_resources = to_state_dict(axis_resources)
   if mesh is None:
     mesh = _get_current_mesh()
   if mesh.empty:
     raise ValueError("You must pass a non-empty mesh. If you didn't pass any, "
                      "check that you called save_checkpoint from a maps.mesh "
                      "context.")
-  filepath_map = _make_save_checkpoint_filepath_map(prefix, tree,
-                                                    axis_resources, mesh,
-                                                    num_shards)
+  filepath_map = _make_save_checkpoint_filepath_map(
+      prefix, tree, axis_resources, mesh, num_shards, version)
   if makedirs:
     # Process 0 creates the workdir if it doesn't exist. All processes wait
     # until it's done.
@@ -237,14 +305,12 @@ def _create_lazy_array_chunks_per_shard(
     local_mesh: Optional[Mesh],
 ) -> Mapping[int, LazyArrayChunks]:
   """Creates mapping from shard to LazyArrayChunks.
-
   A "chunk" is the result of taking a SliceNd object and using it to slice
   a particular array. A LazyArrayChunks object represents all the chunks from
   all arrays that must be written on a particular checkpoint shard. We don't
   directly chunk the arrays here, since this could incur in some extra memory
   used (at the moment of writing a shard: original data + chunks + serialized
   chunks).
-
   Args:
     ndarrays: Sequence of input arrays.
     local_slices_arrays: Sequence of SliceNdArray indicating how each input
@@ -259,7 +325,6 @@ def _create_lazy_array_chunks_per_shard(
       shard.
     mesh: Global mesh of devices.
     local_mesh: Local (restricted to a given process) mesh of devices.
-
   Returns:
     A dictionary mapping shards (integers) to LazyArrayChunks.
   """
@@ -309,7 +374,7 @@ def _intersect_slice_nd(
 
 def _make_save_checkpoint_filepath_map(
     prefix: str, tree: PyTree, axis_resources: PyTree, mesh: Mesh,
-    num_shards: int = 0):
+    num_shards: int = 0, version: Version = Version.V1):
   """Makes a dictionary of filepaths mapping to the content that must be serialized."""
   filepath_map = {}  # Result.
   tree_leaves, struct = jax.tree_flatten(tree)
@@ -373,6 +438,8 @@ def _make_save_checkpoint_filepath_map(
         'shard_count': shard_count,
         'index': struct.unflatten(index_leaves),
     }
+    if version is not Version.UNKNOWN:
+      filepath_map[prefix + '.index']['version'] = version.value
   # Assign the LazyArrayChunks objects to the corresponding shard filepaths.
   shard_fpath_fn = functools.partial(
       vmoe.checkpoints.base.add_shard_suffix,
@@ -413,28 +480,23 @@ def _match_checkpoint_to_local_slices(
     ckpt_slices_and_shards: Iterable[Tuple[SliceNd, int]],
 ) -> Iterator[Tuple[int, SliceNd, SliceNd, SliceNd]]:
   """Matches slices in checkpoints to local slices.
-
   When a checkpoint is written, a given array might be partitioned in a certain
   way which differs from the target partitioning when the checkpoint is
   restored (e.g. if a model is fine-tuned on a different hardware topology).
-
   We must map the global slices that the local devices hold with the slices in
   the checkpoint files. Notice that, because the partitioning is different, this
   is not a 1-to-1 mapping. If a global slice intersects with a checkpoint slice,
   then part of the array in the checkpoint needs to be restored to fill part of
   the local array.
-
   This function yields (shard, ckpt_slice, ckpt_subslice, local_subslice),
   respectively denoting:
     - The checkpoint shard to be restored.
     - The (global) checkpoint slice that needs to be restored from the shard.
     - The (sub)slice in the checkpoint chunk that needs to be copied to
     - the (sub)slice in the local array.
-
   Args:
     local_global_slices: Iterable of (local slice, global slice).
     ckpt_slices_and_shards: Iterable of (ckpt slice, shard).
-
   Yields:
     A sequence of tuples (int, SliceNd, SliceNd, SliceNd).
   """
@@ -461,7 +523,6 @@ def _pair_local_and_global_slices(
     local_mesh: Optional[Mesh] = None,
 ) -> Iterator[Sequence[Tuple[SliceNd, SliceNd]]]:
   """Returns an iterator over sets of pairs (local SliceNd, global SliceNd).
-
   Args:
     local_slices_arrays: Sequence of SliceNdArray indicating how each input
       array is partitioned across the local (for the current process) mesh of
@@ -470,7 +531,6 @@ def _pair_local_and_global_slices(
       array is partitioned across the global mesh of devices.
     mesh: Global mesh of devices.
     local_mesh: Local (restricted to a given process) mesh of devices.
-
   Returns:
     Iterator over sequences of (global sliceNd, local sliceNd).
   """
@@ -520,7 +580,6 @@ def _restore_array_chunks(
                                                          SliceNd]]],
 ):
   """Restores array chunks from a checkpoint file, filling local arrays.
-
   Args:
     filepath: Filepath of the file to restore from. This is typically the
       filepath of a checkpoint shard.
@@ -551,7 +610,6 @@ def _slice_nd_arrays_to_shards(
     devices: np.ndarray,
     num_shards: int) -> Tuple[Sequence[Sequence[int]], Tuple[int, ...]]:
   """Returns the shards used to store each slice, for each SliceNdArray.
-
   Example:
     Suppose that an array with shape (8, 4), is sliced on a (2, 2) mesh as
     specified by the following SliceNdArray object:
@@ -561,24 +619,20 @@ def _slice_nd_arrays_to_shards(
     ]
     Notice that the first axis has two slices across the first mesh axis, and
     the second axis is replicated.
-
     Suppose that each device is handled by a different process, and they are
     arranged in the mesh as follows (each device represented by their ID):
     [[0, 2],
      [1, 3]]
-
     Now, suppose that we want to checkpoint the array using 2 checkpoint shards.
     Then, the output array will be [0, 1], indicating that the first slice
     (i.e. (Slice(0, 4), Slice())) will be stored in the shard=0, and the second
     slice (i.e. (Slice(4, 8), Slice())) will be saved in the next shard=1.
-
   Args:
     slice_nd_arrays: A sequence of SliceNdArray.
     devices: Numpy array representing the logical mesh of devices.
     num_shards: (Tentative) number of checkpoint shards to use. The slices will
       be roughly uniformly distributed among these. If `num_shards <= 0` then,
       the minimum number of shards necessary is used.
-
   Returns:
     - A list of the same size as the input list (i.e. number of arrays),
       where each element is a list of integers denoting which shard is used to

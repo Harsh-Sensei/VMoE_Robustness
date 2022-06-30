@@ -49,6 +49,7 @@ def find_latest_complete_checkpoint_for_prefix(
   """
   for step in iterate_complete_steps_for_prefix(
       prefix, suffixes=suffixes, decreasing=True):
+    print("Obtained step number: ",step)
     return prefix + f'_{step}'
   return None
 

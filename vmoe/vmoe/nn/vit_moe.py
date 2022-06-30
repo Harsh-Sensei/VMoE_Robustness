@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Module with gating layers."""
-from typing import Any, Iterable, Mapping, Optional, Tuple, Type, Union
+from typing import Any, Iterable, Mapping, Optional, Tuple, Type, Union, Callable, Sequence
 
 import flax.linen as nn
 import jax.numpy as jnp
@@ -271,6 +271,67 @@ class VisionTransformerMoe(nn.Module):
   @nn.compact
   def __call__(self, inputs):
     # Encode patches into tokens of hidden_size.
+    x = nn.Conv(
+        features=self.hidden_size, kernel_size=self.patch_size,
+        strides=self.patch_size, padding='VALID', name='embedding')(inputs)
+    # Reshape images into sequences of tokens.
+    x = x.reshape(x.shape[0], -1, x.shape[-1])
+    # If we want to add a class token, add it here.
+    if self.classifier == 'token':
+      cls = self.param('cls', nn.initializers.zeros, (1, 1, x.shape[-1]))
+      cls = jnp.tile(cls, [x.shape[0], 1, 1])
+      x = jnp.concatenate([cls, x], axis=1)
+    # Encode tokens unsing the MoE encoder.
+    x, metrics = self.encoder_cls(
+        name='Encoder', deterministic=self.deterministic, **self.encoder)(x)
+    # Get a single vector representation of the full sequence.
+    if self.classifier == 'token' or self.classifier == '0':
+      x = x[:, 0]
+    elif self.classifier == 'gap':
+      x = x.mean(axis=tuple(range(1, x.ndim - 1)))
+    elif self.classifier == 'map':
+      x = MapHead(
+          num_heads=self.encoder['num_heads'], mlp_dim=self.encoder['mlp_dim'],
+          name='MapHead')(x)
+    else:
+      raise ValueError(f'Unknown classifier: {self.classifier!r}')
+    if self.representation_size is not None:
+      x = nn.Dense(features=self.representation_size, name='pre_logits')(x)
+      x = nn.tanh(x)
+    else:
+      x = IdentityLayer(name='pre_logits')(x)
+    if self.num_classes:
+      # Linear head outputing the logits for classification.
+      logits = nn.Dense(
+          features=self.num_classes,
+          name='head',
+          kernel_init=nn.initializers.zeros,
+          bias_init=nn.initializers.constant(self.head_bias_init))(x)
+      return logits, metrics
+    else:
+      return x, metrics
+
+
+class VisionTransformerMoe_AdversarialAttack(nn.Module):
+  """Vision Transformer with Sparse MoE layers.
+
+  This is the model used in the paper https://arxiv.org/abs/2106.05974.
+  """
+  num_classes: Optional[int]
+  patch_size: Tuple[int, int]
+  hidden_size: int
+  encoder: KwArgs
+  classifier: str = 'token'
+  representation_size: Optional[int] = None
+  deterministic: bool = False
+  head_bias_init: float = 0.0
+  encoder_cls: Type[nn.Module] = EncoderMoe
+  delta_init: Callable = nn.initializers.zeros
+
+  @nn.compact
+  def __call__(self, inputs):
+    # Encode patches into tokens of hidden_size.
+
     x = nn.Conv(
         features=self.hidden_size, kernel_size=self.patch_size,
         strides=self.patch_size, padding='VALID', name='embedding')(inputs)
